@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-enqueue-audio"
+description = "Enables the enqueue_audio command without any pre-configured scope."
+commands.allow = ["enqueue_audio"]
+
+[[permission]]
+identifier = "deny-enqueue-audio"
+description = "Denies the enqueue_audio command without any pre-configured scope."
+commands.deny = ["enqueue_audio"]

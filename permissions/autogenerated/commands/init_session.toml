@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-init-session"
+description = "Enables the init_session command without any pre-configured scope."
+commands.allow = ["init_session"]
+
+[[permission]]
+identifier = "deny-init-session"
+description = "Denies the init_session command without any pre-configured scope."
+commands.deny = ["init_session"]

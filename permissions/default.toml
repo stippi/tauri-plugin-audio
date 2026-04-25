@@ -1,0 +1,10 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Default permissions for the audio plugin - allows session management and playback enqueue"
+permissions = [
+    "allow-init-session",
+    "allow-teardown-session",
+    "allow-enqueue-audio",
+    "allow-get-status",
+]
