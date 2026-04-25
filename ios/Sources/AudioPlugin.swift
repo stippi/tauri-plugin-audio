@@ -1,6 +1,7 @@
 import AVFoundation
 import Tauri
 import UIKit
+import WebKit
 
 // ---------------------------------------------------------------------------
 // MARK: - Rust FFI declarations
@@ -24,6 +25,19 @@ func rust_audio_render_callback(
     _ frameCount: UInt32
 ) -> UInt32
 
+/// Report engine configuration to Rust for diagnostic logging.
+/// Called once during setupEngine after resolving hw/playback rates.
+@_silgen_name("rust_audio_report_engine_config")
+func rust_audio_report_engine_config(
+    _ hwSampleRate: UInt32,
+    _ pbSampleRate: UInt32,
+    _ upsampleRatio: UInt32
+)
+
+/// Report engine running state to Rust for diagnostic logging.
+@_silgen_name("rust_audio_report_engine_running")
+func rust_audio_report_engine_running(_ running: UInt32)
+
 // ---------------------------------------------------------------------------
 // MARK: - AudioPlugin
 // ---------------------------------------------------------------------------
@@ -34,11 +48,19 @@ func rust_audio_render_callback(
 ///
 /// Lifecycle:
 ///   1. Frontend calls `initSession` when entering the tutor screen.
-///      → AVAudioSession configured (.playAndRecord, .voiceChat, NO ducking)
+///      → AVAudioSession configured (.playAndRecord, NO ducking)
 ///      → AVAudioEngine created with input tap + source node
 ///      → engine.start() — mic is hot, speaker ready
 ///   2. Frontend calls `teardownSession` when leaving the tutor screen.
 ///      → engine stopped, tap removed, source node detached, session deactivated
+///
+/// Recovery:
+///   The WKWebView shares `AVAudioSession.sharedInstance()`. When the frontend
+///   shuts down its WebAudio AudioContext, the WebView reconfigures the audio
+///   session, which invalidates our AVAudioEngine. We observe
+///   `configurationChangeNotification` and fully rebuild the engine when this
+///   happens. Rebuilds are debounced (500ms) to avoid cascading when our own
+///   `activateAudioSession` triggers additional config change notifications.
 class AudioPlugin: Plugin {
 
     // -- Engine --
@@ -46,6 +68,25 @@ class AudioPlugin: Plugin {
     private var sourceNode: AVAudioSourceNode?
     private var tapInstalled = false
     private var sessionActive = false
+
+    /// Counter incremented on each full rebuild (setup cycle).
+    /// Logged via Rust diagnostics so we can see rebuilds in the log file.
+    private var engineBuildCount: Int = 0
+
+    /// True while setupEngine() is executing. Config-change notifications
+    /// that arrive during our own setup are ignored (they're caused by
+    /// our `activateAudioSession` call).
+    private var isSettingUp = false
+
+    /// Pending debounced rebuild work item. Cancelled if a new config
+    /// change arrives within the debounce window.
+    private var pendingRebuild: DispatchWorkItem?
+
+    /// Debounce interval for config-change rebuilds.
+    /// Needs to be long enough to absorb the cascade from our own
+    /// activateAudioSession, but short enough that the engine recovers
+    /// before the user notices.
+    private let rebuildDebounceMs: Int = 300
 
     // -- Config (set via initSession args) --
     private var captureSampleRate: Double = 48_000
@@ -74,6 +115,12 @@ class AudioPlugin: Plugin {
             name: AVAudioSession.routeChangeNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleConfigChange(_:)),
+            name: .AVAudioEngineConfigurationChange,
+            object: nil
+        )
     }
 
     deinit {
@@ -82,19 +129,25 @@ class AudioPlugin: Plugin {
     }
 
     // -----------------------------------------------------------------------
-    // MARK: - Audio session (no ducking)
+    // MARK: - Audio session (no ducking, no voice processing)
     // -----------------------------------------------------------------------
 
     private func activateAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
         // .playAndRecord: simultaneous mic + speaker.
-        // .voiceChat: echo cancellation, low latency.
-        // Options: bluetooth, default to speaker. Explicitly NO .duckOthers —
-        // our own playback goes through the same engine, so there is nothing to duck.
+        // .default mode: NO voice processing (AGC/echo-cancel).
+        //   We use PTT (push-to-talk), not full duplex, so echo
+        //   cancellation is unnecessary. Voice processing in .voiceChat
+        //   mode crushes playback volume via AGC while the mic is hot.
+        // Options:
+        //   .defaultToSpeaker — route to speaker, not earpiece.
+        //   .allowBluetooth*  — support BT headsets.
+        //   NO .duckOthers    — our own playback goes through the same
+        //                       engine, so there is nothing to duck.
         try session.setCategory(
             .playAndRecord,
-            mode: .voiceChat,
-            options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
+            mode: .default,
+            options: [.allowBluetoothHFP, .allowBluetoothA2DP, .defaultToSpeaker]
         )
         try session.setActive(true, options: [.notifyOthersOnDeactivation])
     }
@@ -115,9 +168,13 @@ class AudioPlugin: Plugin {
     // -----------------------------------------------------------------------
 
     /// Build and start the engine with both the capture tap and playback source node.
+    /// Must be called on pluginQueue.
     private func setupEngine() throws {
-        // Clean slate.
-        teardownEngineSync()
+        isSettingUp = true
+        defer { isSettingUp = false }
+
+        // Clean slate (without deactivating the audio session if we're rebuilding).
+        teardownEngineOnly()
 
         try activateAudioSession()
 
@@ -140,18 +197,58 @@ class AudioPlugin: Plugin {
         tapInstalled = true
 
         // -- Playback source node --
+        //
+        // Create at the hardware sample rate so the source node's render block
+        // is called at the rate the engine actually runs (usually 48 kHz).
+        // Rust pushes audio at playbackSampleRate (24 kHz); we up-sample with
+        // simple sample-repetition in the render block below.
+        let hwRate = hwFormat.sampleRate
         let pbFormat = AVAudioFormat(
-            standardFormatWithSampleRate: playbackSampleRate,
+            standardFormatWithSampleRate: hwRate,
             channels: playbackChannels
         )!
 
+        // Pre-compute integer ratio for cheap upsampling (e.g. 48000/24000 = 2).
+        let ratio = max(1, Int(hwRate / playbackSampleRate))
         let node = AVAudioSourceNode(format: pbFormat) { _, _, frameCount, audioBufferList -> OSStatus in
             let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
             guard let buf = ablPointer.first,
                   let data = buf.mData?.assumingMemoryBound(to: Float.self) else {
                 return noErr
             }
-            let _ = rust_audio_render_callback(data, frameCount)
+
+            let frames = Int(frameCount)
+
+            if ratio <= 1 {
+                // No upsampling needed — hw rate == playback rate.
+                let _ = rust_audio_render_callback(data, frameCount)
+            } else {
+                // Pull (frames / ratio) source samples, then duplicate each sample `ratio` times.
+                let srcFrames = frames / ratio
+                // Use the tail of the output buffer as scratch space for source samples.
+                // Safety: we read scratch[i] (at offset frames-srcFrames+i) before writing
+                // past that point. For ratio=2 the write cursor is always at 2*i+1 which
+                // stays below frames-srcFrames+i+1 for all valid i.
+                let scratch = data.advanced(by: frames - srcFrames)
+                let pulled = Int(rust_audio_render_callback(scratch, UInt32(srcFrames)))
+
+                var dst = 0
+                for i in 0..<pulled {
+                    let sample = scratch[i]
+                    for _ in 0..<ratio {
+                        if dst < frames {
+                            data[dst] = sample
+                            dst += 1
+                        }
+                    }
+                }
+                // Zero-fill any remainder.
+                while dst < frames {
+                    data[dst] = 0.0
+                    dst += 1
+                }
+            }
+
             return noErr
         }
 
@@ -159,13 +256,24 @@ class AudioPlugin: Plugin {
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: pbFormat)
 
+        // Report engine config to Rust so it shows up in diagnostic logs.
+        engineBuildCount += 1
+        rust_audio_report_engine_config(
+            UInt32(hwRate),
+            UInt32(playbackSampleRate),
+            UInt32(ratio)
+        )
+
         // -- Start --
         try engine.start()
         sessionActive = true
+        rust_audio_report_engine_running(1)
     }
 
-    /// Synchronous teardown — safe to call from any context on pluginQueue.
-    private func teardownEngineSync() {
+    /// Tear down the engine graph without deactivating the audio session.
+    /// Used during rebuilds (configurationChange) where we want to keep
+    /// the session active and immediately re-setup.
+    private func teardownEngineOnly() {
         if tapInstalled, let engine = audioEngine {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
@@ -177,7 +285,15 @@ class AudioPlugin: Plugin {
         sourceNode = nil
         audioEngine?.stop()
         audioEngine = nil
+        rust_audio_report_engine_running(0)
+    }
 
+    /// Full teardown — stops engine AND deactivates the audio session.
+    /// Used when the user leaves the tutor screen (teardownSession).
+    private func teardownEngineSync() {
+        pendingRebuild?.cancel()
+        pendingRebuild = nil
+        teardownEngineOnly()
         if sessionActive {
             deactivateAudioSession()
         }
@@ -185,7 +301,38 @@ class AudioPlugin: Plugin {
     }
 
     // -----------------------------------------------------------------------
-    // MARK: - Interruption / route change
+    // MARK: - Engine rebuild (configuration change recovery)
+    // -----------------------------------------------------------------------
+
+    /// Schedule a debounced engine rebuild. Multiple rapid config changes
+    /// are coalesced — only the last one triggers an actual rebuild.
+    /// Must be called on pluginQueue.
+    private func scheduleRebuild() {
+        guard sessionActive else { return }
+
+        // Cancel any previously scheduled rebuild.
+        pendingRebuild?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.sessionActive else { return }
+            self.pendingRebuild = nil
+            do {
+                try self.setupEngine()
+            } catch {
+                NSLog("[AudioPlugin] Failed to rebuild engine: \(error)")
+                self.sessionActive = false
+                rust_audio_report_engine_running(0)
+            }
+        }
+        pendingRebuild = work
+        pluginQueue.asyncAfter(
+            deadline: .now() + .milliseconds(rebuildDebounceMs),
+            execute: work
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // MARK: - Interruption / route change / config change
     // -----------------------------------------------------------------------
 
     @objc private func handleInterruption(_ notification: Notification) {
@@ -197,16 +344,12 @@ class AudioPlugin: Plugin {
             guard let self = self, self.sessionActive else { return }
             switch type {
             case .began:
-                break // Engine is paused by the system.
+                rust_audio_report_engine_running(0)
             case .ended:
-                // Try to restart.
-                if let engine = self.audioEngine, !engine.isRunning {
-                    do {
-                        try engine.start()
-                    } catch {
-                        NSLog("[AudioPlugin] Failed to restart after interruption: \(error)")
-                    }
-                }
+                // Rebuild the full engine — a simple engine.start() is not
+                // reliable after the audio session was interrupted, because
+                // the hardware format may have changed.
+                self.scheduleRebuild()
             @unknown default:
                 break
             }
@@ -214,21 +357,25 @@ class AudioPlugin: Plugin {
     }
 
     @objc private func handleRouteChange(_ notification: Notification) {
-        guard let info = notification.userInfo,
-              let reasonValue = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
-              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
-
         pluginQueue.async { [weak self] in
             guard let self = self, self.sessionActive else { return }
-            if reason == .oldDeviceUnavailable {
-                if let engine = self.audioEngine, !engine.isRunning {
-                    do {
-                        try engine.start()
-                    } catch {
-                        NSLog("[AudioPlugin] Failed to restart after route change: \(error)")
-                    }
-                }
+            // After any route change, check if engine is still running.
+            if let engine = self.audioEngine, !engine.isRunning {
+                self.scheduleRebuild()
             }
+        }
+    }
+
+    /// Fired when the audio engine's underlying hardware config changes.
+    /// This happens when WKWebView reconfigures the shared AVAudioSession
+    /// (e.g. when it closes its AudioContext). The engine is invalidated
+    /// and must be rebuilt from scratch.
+    @objc private func handleConfigChange(_ notification: Notification) {
+        pluginQueue.async { [weak self] in
+            guard let self = self, self.sessionActive else { return }
+            // Skip config changes caused by our own setupEngine.
+            guard !self.isSettingUp else { return }
+            self.scheduleRebuild()
         }
     }
 
@@ -237,7 +384,13 @@ class AudioPlugin: Plugin {
     // -----------------------------------------------------------------------
 
     @objc func initSession(_ invoke: Invoke) {
-        let args = invoke.parseArgs(InitSessionArgs.self)
+        let args: InitSessionArgs
+        do {
+            args = try invoke.parseArgs(InitSessionArgs.self)
+        } catch {
+            NSLog("[AudioPlugin] Failed to parse initSession args, using defaults: \(error)")
+            args = InitSessionArgs()
+        }
 
         pluginQueue.async { [weak self] in
             guard let self = self else { return }
@@ -248,11 +401,11 @@ class AudioPlugin: Plugin {
             }
 
             // Apply config from args.
-            if let sr = args?.captureSampleRate { self.captureSampleRate = Double(sr) }
-            if let sr = args?.playbackSampleRate { self.playbackSampleRate = Double(sr) }
-            if let ch = args?.captureChannels { self.captureChannels = UInt32(ch) }
-            if let ch = args?.playbackChannels { self.playbackChannels = UInt32(ch) }
-            if let bs = args?.captureBufferSize { self.captureBufferSize = UInt32(bs) }
+            if let sr = args.captureSampleRate { self.captureSampleRate = Double(sr) }
+            if let sr = args.playbackSampleRate { self.playbackSampleRate = Double(sr) }
+            if let ch = args.captureChannels { self.captureChannels = UInt32(ch) }
+            if let ch = args.playbackChannels { self.playbackChannels = UInt32(ch) }
+            if let bs = args.captureBufferSize { self.captureBufferSize = UInt32(bs) }
 
             do {
                 try self.setupEngine()
@@ -281,8 +434,11 @@ class AudioPlugin: Plugin {
     @objc func getStatus(_ invoke: Invoke) {
         pluginQueue.async { [weak self] in
             guard let self = self else { return }
+            let running = self.audioEngine?.isRunning ?? false
             invoke.resolve([
                 "session": self.sessionActive ? "active" : "inactive",
+                "engineRunning": running,
+                "engineBuildCount": self.engineBuildCount,
                 "playbackBuffered": 0,  // Tracked on Rust side
                 "prerollBuffered": 0,   // Tracked on Rust side
             ])
@@ -301,6 +457,15 @@ struct InitSessionArgs: Decodable {
     let playbackChannels: Int?
     let captureBufferSize: Int?
     let prerollMs: Int?
+
+    init() {
+        self.captureSampleRate = nil
+        self.playbackSampleRate = nil
+        self.captureChannels = nil
+        self.playbackChannels = nil
+        self.captureBufferSize = nil
+        self.prerollMs = nil
+    }
 }
 
 // ---------------------------------------------------------------------------
