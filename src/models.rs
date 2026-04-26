@@ -36,7 +36,7 @@ pub struct SessionConfig {
     #[serde(default = "default_buffer_size")]
     pub capture_buffer_size: u32,
 
-    /// Duration of the pre-roll buffer in milliseconds. Default: 800.
+    /// Duration of the pre-roll buffer in milliseconds. Default: 500.
     /// The plugin keeps a rolling window of the last N ms of captured audio
     /// so that PTT can include audio from before the button press.
     #[serde(default = "default_preroll_ms")]
@@ -73,7 +73,7 @@ fn default_buffer_size() -> u32 {
 }
 
 fn default_preroll_ms() -> u32 {
-    800
+    500
 }
 
 // ---------------------------------------------------------------------------
@@ -110,8 +110,6 @@ pub struct AudioStatus {
     pub session: SessionState,
     /// Number of samples currently in the playback ring buffer.
     pub playback_buffered: usize,
-    /// Number of samples currently in the pre-roll window.
-    pub preroll_buffered: usize,
 }
 
 /// Generic success response.
@@ -152,7 +150,7 @@ mod tests {
         assert_eq!(cfg.capture_channels, 1);
         assert_eq!(cfg.playback_channels, 1);
         assert_eq!(cfg.capture_buffer_size, 1024);
-        assert_eq!(cfg.preroll_ms, 800);
+        assert_eq!(cfg.preroll_ms, 500);
     }
 
     #[test]
@@ -190,12 +188,10 @@ mod tests {
         let status = AudioStatus {
             session: SessionState::Active,
             playback_buffered: 1024,
-            preroll_buffered: 8000,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"session\":\"active\""));
         assert!(json.contains("\"playbackBuffered\":1024"));
-        assert!(json.contains("\"prerollBuffered\":8000"));
     }
 
     // Needed so session_config_empty_json comparison works

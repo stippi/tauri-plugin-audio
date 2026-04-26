@@ -2,20 +2,14 @@
 //!
 //! # Architecture
 //!
-//! There are three buffers:
+//! There are two ring buffers:
 //!
-//! 1. **Pre-roll ring buffer** — A fixed-size circular buffer that always
-//!    holds the last N ms of captured audio. New samples overwrite the
-//!    oldest. This is *not* a FIFO pipe — it's a rolling window.
-//!    When PTT fires, consumers snapshot this buffer to get the audio
-//!    from before the button press.
+//! 1. **Capture SPSC** — A standard SPSC ring buffer for mic capture.
+//!    The Swift/cpal audio callback pushes raw samples here. The Rust-side
+//!    collector task (`capture_queue::run_collector`) drains them into a
+//!    managed `VecDeque` that handles pre-roll windowing and recording.
 //!
-//! 2. **Capture FIFO** — A standard SPSC ring buffer for live capture
-//!    streaming. When the Rust consumer wants real-time mic data (e.g.
-//!    during an active PTT/STT session), it drains from here.
-//!    The Swift tap pushes into *both* the pre-roll and the capture FIFO.
-//!
-//! 3. **Playback FIFO** — SPSC ring buffer for TTS output. Rust pushes
+//! 2. **Playback FIFO** — SPSC ring buffer for TTS output. Rust pushes
 //!    samples in, Swift's `AVAudioSourceNode` render block pulls them out.
 //!
 //! # Safety
@@ -26,7 +20,7 @@
 //! - No logging / println
 //! - If a lock is contended, drop the buffer and move on
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use ringbuf::{
@@ -38,11 +32,12 @@ use ringbuf::{
 // Capacities
 // ---------------------------------------------------------------------------
 
-/// Capture FIFO capacity. At 48 kHz mono, 48000 = 1 second.
-/// Sized to absorb up to 1s of latency in the Rust consumer.
-const CAPTURE_FIFO_CAPACITY: usize = 48_000;
+/// Capture FIFO capacity. Sized to absorb up to 2s of latency in the Rust
+/// collector at up to 96 kHz mono.
+const CAPTURE_FIFO_CAPACITY: usize = 96_000 * 2;
 
 /// Playback ring buffer — 2 seconds at 48 kHz to absorb jitter.
+/// (Playback is driven at 24kHz content rate, so this is ~4s of audio.)
 const PLAYBACK_RING_CAPACITY: usize = 48_000 * 2;
 
 // ---------------------------------------------------------------------------
@@ -53,75 +48,8 @@ type RbProducer = ringbuf::HeapProd<f32>;
 type RbConsumer = ringbuf::HeapCons<f32>;
 
 // ---------------------------------------------------------------------------
-// Pre-roll rolling window
-// ---------------------------------------------------------------------------
-
-/// A fixed-size circular buffer that overwrites the oldest samples.
-/// NOT a FIFO — all data is always accessible via `snapshot()`.
-///
-/// Thread safety: the Swift audio tap (single producer) writes via
-/// `push_samples`. The Rust consumer (single reader) calls `snapshot`.
-/// These can race, so we use a Mutex with try_lock on the write side
-/// (realtime thread) and blocking lock on the read side (worker thread).
-struct PreRollBuffer {
-    data: Vec<f32>,
-    capacity: usize,
-    write_pos: usize,
-    len: usize,
-}
-
-impl PreRollBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            data: vec![0.0; capacity],
-            capacity,
-            write_pos: 0,
-            len: 0,
-        }
-    }
-
-    /// Write samples into the rolling window, overwriting the oldest.
-    fn push_samples(&mut self, samples: &[f32]) {
-        for &s in samples {
-            self.data[self.write_pos] = s;
-            self.write_pos = (self.write_pos + 1) % self.capacity;
-            if self.len < self.capacity {
-                self.len += 1;
-            }
-        }
-    }
-
-    /// Get a snapshot of the current rolling window contents in
-    /// chronological order (oldest first).
-    fn snapshot(&self) -> Vec<f32> {
-        if self.len < self.capacity {
-            // Buffer not yet full — data starts at 0.
-            self.data[..self.len].to_vec()
-        } else {
-            // Buffer is full — oldest sample is at write_pos.
-            let mut out = Vec::with_capacity(self.capacity);
-            out.extend_from_slice(&self.data[self.write_pos..]);
-            out.extend_from_slice(&self.data[..self.write_pos]);
-            out
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Clear the buffer.
-    fn clear(&mut self) {
-        self.write_pos = 0;
-        self.len = 0;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
-
-static PRE_ROLL: OnceLock<std::sync::Mutex<PreRollBuffer>> = OnceLock::new();
 
 static CAPTURE_PRODUCER: OnceLock<std::sync::Mutex<RbProducer>> = OnceLock::new();
 static CAPTURE_CONSUMER: OnceLock<std::sync::Mutex<RbConsumer>> = OnceLock::new();
@@ -134,6 +62,32 @@ static PLAYBACK_CONSUMER: OnceLock<std::sync::Mutex<RbConsumer>> = OnceLock::new
 /// but good enough for status reporting.
 static PLAYBACK_LEVEL: AtomicUsize = AtomicUsize::new(0);
 
+/// Monotonic instant (as nanos since an arbitrary epoch via `Instant`) at which
+/// the render callback last pulled >0 real samples from the playback ring.
+/// Used by the drain monitor to add a grace period after the ring buffer empties,
+/// accounting for OS audio pipeline latency between ring-buffer drain and actual
+/// speaker output (especially relevant on macOS where cpal pulls aggressively).
+static LAST_NONZERO_PULL_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Set by the agent loop when all audio for the current turn has been pushed
+/// into the ring buffer. The render callback checks this: when it's set AND
+/// the ring buffer is empty, it stamps `PLAYBACK_DRAINED_NANOS`.
+/// Reset at the start of each new turn via `begin_playback_turn()`.
+static PLAYBACK_ALL_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// Monotonic timestamp (nanos) at which the render callback first observed
+/// an empty ring buffer after `PLAYBACK_ALL_PUSHED` was set. Zero means
+/// drain hasn't been detected yet.
+static PLAYBACK_DRAINED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a monotonic nanosecond timestamp (relative to process start).
+/// Safe to call from realtime threads — no allocation, no syscall on most platforms.
+fn mono_nanos() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    epoch.elapsed().as_nanos() as u64
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostic counters (relaxed atomics, safe from realtime threads)
 // ---------------------------------------------------------------------------
@@ -144,8 +98,6 @@ static CAPTURE_SAMPLES_PUSHED: AtomicUsize = AtomicUsize::new(0);
 static CAPTURE_SAMPLES_DROPPED: AtomicUsize = AtomicUsize::new(0);
 /// Number of capture callback invocations.
 static CAPTURE_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// Number of times the capture callback failed to acquire the pre-roll lock.
-static CAPTURE_PREROLL_LOCK_FAIL: AtomicUsize = AtomicUsize::new(0);
 /// Number of times the capture callback failed to acquire the FIFO producer lock.
 static CAPTURE_FIFO_LOCK_FAIL: AtomicUsize = AtomicUsize::new(0);
 /// Number of render callback invocations.
@@ -154,10 +106,6 @@ static RENDER_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static RENDER_SAMPLES_PULLED: AtomicUsize = AtomicUsize::new(0);
 /// Number of times the render callback failed to acquire the playback consumer lock.
 static RENDER_LOCK_FAIL: AtomicUsize = AtomicUsize::new(0);
-
-/// Gate: when false, the capture callback skips pushing to the FIFO.
-/// This allows the drain task to clear stale data before enabling live flow.
-static CAPTURE_FIFO_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // ---------------------------------------------------------------------------
 // Engine config reported by Swift at setup time (stored as atomics)
@@ -184,15 +132,12 @@ pub struct AudioDiagnostics {
     pub capture_callback_count: usize,
     pub capture_samples_pushed: usize,
     pub capture_samples_dropped: usize,
-    pub capture_preroll_lock_fail: usize,
     pub capture_fifo_lock_fail: usize,
     pub capture_fifo_level: usize,
-    pub capture_fifo_enabled: bool,
     pub render_callback_count: usize,
     pub render_samples_pulled: usize,
     pub render_lock_fail: usize,
     pub playback_level: usize,
-    pub preroll_level: usize,
     pub engine_hw_rate: usize,
     pub engine_pb_rate: usize,
     pub engine_upsample_ratio: usize,
@@ -204,21 +149,18 @@ impl std::fmt::Display for AudioDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "capture(cb={} pushed={} dropped={} fifo_lvl={} fifo_on={} pr_lockfail={} fifo_lockfail={}) \
+            "capture(cb={} pushed={} dropped={} fifo_lvl={} fifo_lockfail={}) \
              render(cb={} pulled={} lockfail={}) \
-             playback_lvl={} preroll_lvl={} engine(hw={}Hz pb={}Hz ratio={} running={} builds={})",
+             playback_lvl={} engine(hw={}Hz pb={}Hz ratio={} running={} builds={})",
             self.capture_callback_count,
             self.capture_samples_pushed,
             self.capture_samples_dropped,
             self.capture_fifo_level,
-            self.capture_fifo_enabled,
-            self.capture_preroll_lock_fail,
             self.capture_fifo_lock_fail,
             self.render_callback_count,
             self.render_samples_pulled,
             self.render_lock_fail,
             self.playback_level,
-            self.preroll_level,
             self.engine_hw_rate,
             self.engine_pb_rate,
             self.engine_upsample_ratio,
@@ -233,12 +175,7 @@ impl std::fmt::Display for AudioDiagnostics {
 // ---------------------------------------------------------------------------
 
 /// Initialize all ring buffers. Called once during plugin setup.
-///
-/// `preroll_capacity` is the number of samples for the rolling window
-/// (e.g. 800ms * 48kHz = 38400 samples).
-pub fn init_ring_buffers(preroll_capacity: usize) {
-    let _ = PRE_ROLL.set(std::sync::Mutex::new(PreRollBuffer::new(preroll_capacity)));
-
+pub fn init_ring_buffers() {
     let capture_rb = HeapRb::<f32>::new(CAPTURE_FIFO_CAPACITY);
     let (prod, cons) = capture_rb.split();
     let _ = CAPTURE_PRODUCER.set(std::sync::Mutex::new(prod));
@@ -248,9 +185,6 @@ pub fn init_ring_buffers(preroll_capacity: usize) {
     let (prod, cons) = playback_rb.split();
     let _ = PLAYBACK_PRODUCER.set(std::sync::Mutex::new(prod));
     let _ = PLAYBACK_CONSUMER.set(std::sync::Mutex::new(cons));
-
-    // Start with FIFO enabled.
-    CAPTURE_FIFO_ENABLED.store(true, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -258,12 +192,13 @@ pub fn init_ring_buffers(preroll_capacity: usize) {
 // ---------------------------------------------------------------------------
 
 /// Push samples into the playback ring buffer.
-/// Called from Rust when TTS produces audio or via `enqueue_audio`.
-/// Returns the number of samples actually written.
 ///
-/// This runs on a normal (non-realtime) thread, so it uses a blocking lock.
-/// The realtime render callback uses `try_lock` on the consumer side, so
-/// contention is brief (render only holds the lock for a memcpy).
+/// Writes as many samples as currently fit into the ring buffer and returns
+/// the count. Callers that need backpressure (to avoid dropping audio) should
+/// use `push_playback_samples_all()` instead, which retries in a loop.
+///
+/// Called from a normal (non-realtime) thread. The realtime render callback
+/// uses `try_lock` on the consumer side, so contention is brief.
 pub fn push_playback_samples(samples: &[f32]) -> usize {
     if let Some(prod) = PLAYBACK_PRODUCER.get() {
         if let Ok(mut prod) = prod.lock() {
@@ -275,8 +210,39 @@ pub fn push_playback_samples(samples: &[f32]) -> usize {
     0
 }
 
-/// Drain captured audio from the live capture FIFO.
-/// Called from a Rust worker thread during active STT streaming.
+/// Push **all** samples into the playback ring buffer, blocking with short
+/// sleeps until space becomes available if the buffer is full. This prevents
+/// silent drops when TTS produces audio faster than the output device consumes
+/// it. **Must be called from a blocking context** (e.g., `spawn_blocking`).
+///
+/// Returns the total number of samples written (always `samples.len()`
+/// unless the producer lock is permanently poisoned).
+pub fn push_playback_samples_all(samples: &[f32]) -> usize {
+    let Some(prod) = PLAYBACK_PRODUCER.get() else {
+        return 0;
+    };
+    let mut written = 0;
+    while written < samples.len() {
+        if let Ok(mut prod) = prod.lock() {
+            let n = prod.push_slice(&samples[written..]);
+            if n > 0 {
+                PLAYBACK_LEVEL.fetch_add(n, Ordering::Relaxed);
+                written += n;
+            }
+        }
+        if written < samples.len() {
+            // Ring buffer full — sleep briefly to let the render callback drain.
+            // 5ms ≈ 240 samples at 48kHz — short enough to avoid audible gaps.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    written
+}
+
+/// Drain captured audio from the capture SPSC ring.
+///
+/// Called by the collector task (`capture_queue::run_collector`) to move
+/// samples from the lock-free ring into the managed queue.
 /// Returns the number of samples read.
 pub fn drain_capture_samples(buf: &mut [f32]) -> usize {
     if let Some(cons) = CAPTURE_CONSUMER.get() {
@@ -287,42 +253,59 @@ pub fn drain_capture_samples(buf: &mut [f32]) -> usize {
     0
 }
 
-/// Snapshot the pre-roll buffer — returns the last N ms of audio in
-/// chronological order. Non-destructive: the pre-roll keeps rolling.
-pub fn snapshot_preroll() -> Vec<f32> {
-    if let Some(pr) = PRE_ROLL.get() {
-        if let Ok(pr) = pr.lock() {
-            return pr.snapshot();
-        }
-    }
-    Vec::new()
-}
-
-/// Clear the pre-roll buffer (e.g. after snapshotting at PTT press).
-pub fn clear_preroll() {
-    if let Some(pr) = PRE_ROLL.get() {
-        if let Ok(mut pr) = pr.lock() {
-            pr.clear();
-        }
-    }
-}
-
 /// Get the approximate number of samples in the playback buffer.
 pub fn playback_level() -> usize {
     PLAYBACK_LEVEL.load(Ordering::Relaxed)
 }
 
-/// Get the number of samples in the pre-roll buffer.
-pub fn preroll_level() -> usize {
-    if let Some(pr) = PRE_ROLL.get() {
-        if let Ok(pr) = pr.lock() {
-            return pr.len();
-        }
+/// Milliseconds elapsed since the render callback last pulled real (non-silent)
+/// samples from the playback ring buffer. Returns `u64::MAX` if no pull has
+/// ever occurred (i.e. playback never started).
+///
+/// The drain monitor uses this to add a grace period after `playback_level()`
+/// reaches zero, compensating for OS audio pipeline latency between ring-buffer
+/// drain and actual speaker output.
+pub fn ms_since_last_playback_pull() -> u64 {
+    let last = LAST_NONZERO_PULL_NANOS.load(Ordering::Relaxed);
+    if last == 0 {
+        return u64::MAX;
     }
-    0
+    let now = mono_nanos();
+    now.saturating_sub(last) / 1_000_000
 }
 
-/// Get the number of samples currently in the capture FIFO.
+/// Reset playback turn state. Call at the start of each agent turn, before
+/// any audio chunks are pushed. Clears the `all_pushed` and `drained` flags
+/// so the drain monitor can work cleanly for the new turn.
+pub fn begin_playback_turn() {
+    PLAYBACK_ALL_PUSHED.store(false, Ordering::Relaxed);
+    PLAYBACK_DRAINED_NANOS.store(0, Ordering::Relaxed);
+}
+
+/// Signal that no more audio will be pushed for the current turn. The render
+/// callback will stamp `PLAYBACK_DRAINED_NANOS` once it observes an empty
+/// ring buffer after this flag is set.
+pub fn mark_playback_all_pushed() {
+    PLAYBACK_ALL_PUSHED.store(true, Ordering::Release);
+}
+
+/// Milliseconds elapsed since the render callback confirmed all audio has been
+/// drained *after* `mark_playback_all_pushed()` was called. Returns `None` if
+/// either the flag hasn't been set or drain hasn't been detected yet.
+///
+/// The drain monitor polls this to know when to emit `NativePlaybackComplete`.
+pub fn ms_since_playback_drained() -> Option<u64> {
+    if !PLAYBACK_ALL_PUSHED.load(Ordering::Acquire) {
+        return None;
+    }
+    let ts = PLAYBACK_DRAINED_NANOS.load(Ordering::Relaxed);
+    if ts == 0 {
+        return None;
+    }
+    Some(mono_nanos().saturating_sub(ts) / 1_000_000)
+}
+
+/// Get the number of samples currently in the capture SPSC ring.
 pub fn capture_fifo_level() -> usize {
     if let Some(cons) = CAPTURE_CONSUMER.get() {
         if let Ok(cons) = cons.lock() {
@@ -332,53 +315,18 @@ pub fn capture_fifo_level() -> usize {
     0
 }
 
-/// Reset the capture FIFO: drain all stale samples and reset counters.
-///
-/// Call this right before starting a new drain session. This ensures the
-/// drain loop starts with a clean FIFO rather than stale audio that
-/// accumulated between sessions. The capture callback keeps pushing to
-/// the pre-roll regardless.
-pub fn reset_capture_fifo() {
-    // 1. Temporarily disable FIFO pushes from the capture callback.
-    CAPTURE_FIFO_ENABLED.store(false, Ordering::SeqCst);
-
-    // 2. Drain any stale data from the FIFO.
-    if let Some(cons) = CAPTURE_CONSUMER.get() {
-        if let Ok(mut cons) = cons.lock() {
-            // Skip all available samples.
-            let occupied = cons.occupied_len();
-            cons.skip(occupied);
-        }
-    }
-
-    // 3. Reset capture-side diagnostic counters for the new drain session.
-    //    Render counters are NOT reset — they track cumulative engine activity
-    //    independent of capture drain sessions.
-    CAPTURE_SAMPLES_PUSHED.store(0, Ordering::Relaxed);
-    CAPTURE_SAMPLES_DROPPED.store(0, Ordering::Relaxed);
-    CAPTURE_CALLBACK_COUNT.store(0, Ordering::Relaxed);
-    CAPTURE_PREROLL_LOCK_FAIL.store(0, Ordering::Relaxed);
-    CAPTURE_FIFO_LOCK_FAIL.store(0, Ordering::Relaxed);
-
-    // 4. Re-enable FIFO pushes. From now on, only fresh audio enters.
-    CAPTURE_FIFO_ENABLED.store(true, Ordering::SeqCst);
-}
-
 /// Read all diagnostic counters as a snapshot.
 pub fn diagnostics() -> AudioDiagnostics {
     AudioDiagnostics {
         capture_callback_count: CAPTURE_CALLBACK_COUNT.load(Ordering::Relaxed),
         capture_samples_pushed: CAPTURE_SAMPLES_PUSHED.load(Ordering::Relaxed),
         capture_samples_dropped: CAPTURE_SAMPLES_DROPPED.load(Ordering::Relaxed),
-        capture_preroll_lock_fail: CAPTURE_PREROLL_LOCK_FAIL.load(Ordering::Relaxed),
         capture_fifo_lock_fail: CAPTURE_FIFO_LOCK_FAIL.load(Ordering::Relaxed),
         capture_fifo_level: capture_fifo_level(),
-        capture_fifo_enabled: CAPTURE_FIFO_ENABLED.load(Ordering::Relaxed),
         render_callback_count: RENDER_CALLBACK_COUNT.load(Ordering::Relaxed),
         render_samples_pulled: RENDER_SAMPLES_PULLED.load(Ordering::Relaxed),
         render_lock_fail: RENDER_LOCK_FAIL.load(Ordering::Relaxed),
         playback_level: PLAYBACK_LEVEL.load(Ordering::Relaxed),
-        preroll_level: preroll_level(),
         engine_hw_rate: ENGINE_HW_SAMPLE_RATE.load(Ordering::Relaxed),
         engine_pb_rate: ENGINE_PB_SAMPLE_RATE.load(Ordering::Relaxed),
         engine_upsample_ratio: ENGINE_UPSAMPLE_RATIO.load(Ordering::Relaxed),
@@ -393,9 +341,8 @@ pub fn diagnostics() -> AudioDiagnostics {
 
 /// Called by Swift's `AVAudioEngine` input tap on the realtime audio thread.
 ///
-/// Pushes samples into both:
-/// 1. The pre-roll rolling window (always, for PTT pre-roll)
-/// 2. The capture FIFO (for live STT streaming, when enabled)
+/// Pushes samples into the capture SPSC ring. The collector task
+/// (`capture_queue::run_collector`) drains them on a normal thread.
 ///
 /// # Safety
 ///
@@ -417,28 +364,17 @@ pub unsafe extern "C" fn rust_audio_capture_callback(
 
     CAPTURE_CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    // 1. Push into pre-roll rolling window (always).
-    if let Some(pr) = PRE_ROLL.get() {
-        if let Ok(mut pr) = pr.try_lock() {
-            pr.push_samples(slice);
-        } else {
-            CAPTURE_PREROLL_LOCK_FAIL.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    // 2. Push into capture FIFO for live streaming (when enabled).
-    if CAPTURE_FIFO_ENABLED.load(Ordering::Relaxed) {
-        if let Some(prod) = CAPTURE_PRODUCER.get() {
-            if let Ok(mut prod) = prod.try_lock() {
-                let written = prod.push_slice(slice);
-                CAPTURE_SAMPLES_PUSHED.fetch_add(written, Ordering::Relaxed);
-                let dropped = count - written;
-                if dropped > 0 {
-                    CAPTURE_SAMPLES_DROPPED.fetch_add(dropped, Ordering::Relaxed);
-                }
-            } else {
-                CAPTURE_FIFO_LOCK_FAIL.fetch_add(1, Ordering::Relaxed);
+    // Push into capture SPSC ring.
+    if let Some(prod) = CAPTURE_PRODUCER.get() {
+        if let Ok(mut prod) = prod.try_lock() {
+            let written = prod.push_slice(slice);
+            CAPTURE_SAMPLES_PUSHED.fetch_add(written, Ordering::Relaxed);
+            let dropped = count - written;
+            if dropped > 0 {
+                CAPTURE_SAMPLES_DROPPED.fetch_add(dropped, Ordering::Relaxed);
             }
+        } else {
+            CAPTURE_FIFO_LOCK_FAIL.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -492,6 +428,17 @@ pub unsafe extern "C" fn rust_audio_render_callback(
             if n > 0 {
                 PLAYBACK_LEVEL.fetch_sub(n, Ordering::Relaxed);
                 RENDER_SAMPLES_PULLED.fetch_add(n, Ordering::Relaxed);
+                LAST_NONZERO_PULL_NANOS.store(mono_nanos(), Ordering::Relaxed);
+            } else if PLAYBACK_ALL_PUSHED.load(Ordering::Acquire) {
+                // Ring buffer empty AND the producer has signalled no more audio
+                // will arrive for this turn. Stamp the drained timestamp (only
+                // once — compare-exchange ensures first-write-wins).
+                let _ = PLAYBACK_DRAINED_NANOS.compare_exchange(
+                    0,
+                    mono_nanos(),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
             }
             n
         } else {
@@ -519,70 +466,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preroll_buffer_basic() {
-        let mut buf = PreRollBuffer::new(4);
-        buf.push_samples(&[1.0, 2.0, 3.0]);
-        assert_eq!(buf.snapshot(), vec![1.0, 2.0, 3.0]);
-        assert_eq!(buf.len(), 3);
-    }
-
-    #[test]
-    fn preroll_buffer_overwrite() {
-        let mut buf = PreRollBuffer::new(4);
-        buf.push_samples(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        // Capacity is 4, so oldest (1, 2) are overwritten.
-        assert_eq!(buf.snapshot(), vec![3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(buf.len(), 4);
-    }
-
-    #[test]
-    fn preroll_buffer_exact_fill() {
-        let mut buf = PreRollBuffer::new(3);
-        buf.push_samples(&[10.0, 20.0, 30.0]);
-        assert_eq!(buf.snapshot(), vec![10.0, 20.0, 30.0]);
-    }
-
-    #[test]
-    fn preroll_buffer_wraparound_snapshot_order() {
-        let mut buf = PreRollBuffer::new(4);
-        buf.push_samples(&[1.0, 2.0, 3.0, 4.0]);
-        buf.push_samples(&[5.0]); // overwrites 1.0
-        assert_eq!(buf.snapshot(), vec![2.0, 3.0, 4.0, 5.0]);
-        buf.push_samples(&[6.0]); // overwrites 2.0
-        assert_eq!(buf.snapshot(), vec![3.0, 4.0, 5.0, 6.0]);
-    }
-
-    #[test]
-    fn preroll_buffer_clear() {
-        let mut buf = PreRollBuffer::new(4);
-        buf.push_samples(&[1.0, 2.0, 3.0]);
-        buf.clear();
-        assert_eq!(buf.len(), 0);
-        assert_eq!(buf.snapshot(), Vec::<f32>::new());
-    }
-
-    #[test]
-    fn preroll_buffer_empty() {
-        let buf = PreRollBuffer::new(4);
-        assert_eq!(buf.snapshot(), Vec::<f32>::new());
-        assert_eq!(buf.len(), 0);
-    }
-
-    #[test]
     fn diagnostics_display() {
         let d = AudioDiagnostics {
             capture_callback_count: 100,
             capture_samples_pushed: 50000,
             capture_samples_dropped: 200,
-            capture_preroll_lock_fail: 0,
             capture_fifo_lock_fail: 1,
             capture_fifo_level: 2400,
-            capture_fifo_enabled: true,
             render_callback_count: 80,
             render_samples_pulled: 40000,
             render_lock_fail: 0,
             playback_level: 1000,
-            preroll_level: 38400,
             engine_hw_rate: 48000,
             engine_pb_rate: 24000,
             engine_upsample_ratio: 2,

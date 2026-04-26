@@ -10,6 +10,7 @@ mod desktop;
 #[cfg(mobile)]
 mod mobile;
 
+pub mod capture_queue;
 mod commands;
 mod error;
 pub mod ffi;
@@ -35,8 +36,11 @@ impl<R: Runtime, T: Manager<R>> crate::AudioExt<R> for T {
 
 /// Initialize the audio plugin.
 ///
-/// Ring buffers are created at plugin setup time with a default pre-roll
-/// capacity. The actual audio session is started later via `initSession`
+/// Ring buffers are created at plugin setup time. The capture queue collector
+/// task is spawned as a background async task — it runs forever, managing
+/// the pre-roll window and recording flow.
+///
+/// The actual audio session is started later via `initSession`
 /// (when the user enters the tutor screen) and torn down via
 /// `teardownSession` (when they leave).
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
@@ -48,10 +52,12 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::get_status,
         ])
         .setup(|app, api| {
-            // Pre-allocate ring buffers with a generous default pre-roll.
-            // 800ms at 48kHz = 38400 samples. The actual session config
-            // can request a different pre-roll size; we size for the max.
-            ffi::init_ring_buffers(48_000); // ~1 second headroom
+            // Pre-allocate SPSC ring buffers.
+            ffi::init_ring_buffers();
+
+            // Spawn the collector task that drains the capture SPSC
+            // into the managed queue (pre-roll window / recording).
+            tauri::async_runtime::spawn(capture_queue::run_collector());
 
             #[cfg(mobile)]
             let audio = mobile::init(app, api)?;

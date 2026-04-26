@@ -14,6 +14,8 @@ pub(crate) async fn init_session<R: Runtime>(
     app: AppHandle<R>,
     payload: SessionConfig,
 ) -> Result<OkResponse> {
+    // Configure the capture queue pre-roll window from session config.
+    crate::capture_queue::set_preroll_ms(payload.preroll_ms);
     app.audio().init_session(payload)
 }
 
