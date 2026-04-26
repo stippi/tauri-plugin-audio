@@ -307,6 +307,18 @@
           "markdownDescription": "Denies the enqueue_audio command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_playback_levels command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-playback-levels",
+          "markdownDescription": "Enables the get_playback_levels command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_playback_levels command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-playback-levels",
+          "markdownDescription": "Denies the get_playback_levels command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_status command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-status",
@@ -343,10 +355,10 @@
           "markdownDescription": "Denies the teardown_session command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the audio plugin - allows session management and playback enqueue\n#### This default permission set includes:\n\n- `allow-init-session`\n- `allow-teardown-session`\n- `allow-enqueue-audio`\n- `allow-get-status`",
+          "description": "Default permissions for the audio plugin - allows session management and playback enqueue\n#### This default permission set includes:\n\n- `allow-init-session`\n- `allow-teardown-session`\n- `allow-enqueue-audio`\n- `allow-get-status`\n- `allow-get-playback-levels`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the audio plugin - allows session management and playback enqueue\n#### This default permission set includes:\n\n- `allow-init-session`\n- `allow-teardown-session`\n- `allow-enqueue-audio`\n- `allow-get-status`"
+          "markdownDescription": "Default permissions for the audio plugin - allows session management and playback enqueue\n#### This default permission set includes:\n\n- `allow-init-session`\n- `allow-teardown-session`\n- `allow-enqueue-audio`\n- `allow-get-status`\n- `allow-get-playback-levels`"
         }
       ]
     }

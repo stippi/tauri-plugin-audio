@@ -7,4 +7,5 @@ permissions = [
     "allow-teardown-session",
     "allow-enqueue-audio",
     "allow-get-status",
+    "allow-get-playback-levels",
 ]

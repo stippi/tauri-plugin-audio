@@ -10,6 +10,7 @@ mod desktop;
 #[cfg(mobile)]
 mod mobile;
 
+pub mod analyzer;
 pub mod capture_queue;
 mod commands;
 mod error;
@@ -50,10 +51,12 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::teardown_session,
             commands::enqueue_audio,
             commands::get_status,
+            commands::get_playback_levels,
         ])
         .setup(|app, api| {
-            // Pre-allocate SPSC ring buffers.
+            // Pre-allocate SPSC ring buffers and band analyzer.
             ffi::init_ring_buffers();
+            analyzer::init();
 
             // Spawn the collector task that drains the capture SPSC
             // into the managed queue (pre-roll window / recording).

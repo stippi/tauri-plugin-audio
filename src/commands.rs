@@ -44,3 +44,10 @@ pub(crate) async fn enqueue_audio<R: Runtime>(
 pub(crate) async fn get_status<R: Runtime>(app: AppHandle<R>) -> Result<AudioStatus> {
     app.audio().get_status()
 }
+
+/// Get current playback visualization levels (5 frequency bands, 0.0–1.0).
+/// Intended to be polled by the frontend during active playback (~30fps).
+#[command]
+pub(crate) async fn get_playback_levels() -> Result<[f32; 5]> {
+    Ok(crate::analyzer::get_levels())
+}

@@ -391,6 +391,13 @@ pub extern "C" fn rust_audio_report_engine_config(
     ENGINE_PB_SAMPLE_RATE.store(pb_sample_rate as usize, Ordering::Relaxed);
     ENGINE_UPSAMPLE_RATIO.store(upsample_ratio as usize, Ordering::Relaxed);
     ENGINE_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Reconfigure the band analyzer for the actual playback content rate.
+    // The render callback delivers samples at the content rate (before
+    // upsampling to hw rate), so the analyzer filters must match.
+    if pb_sample_rate > 0 {
+        crate::analyzer::set_sample_rate(pb_sample_rate as f32);
+    }
 }
 
 /// Called by Swift when the engine starts or stops.
@@ -448,6 +455,9 @@ pub unsafe extern "C" fn rust_audio_render_callback(
     } else {
         0
     };
+
+    // Feed the played samples (at content rate) into the band analyzer.
+    crate::analyzer::process(&slice[..read]);
 
     // Zero-fill remainder (silence).
     for sample in &mut slice[read..] {

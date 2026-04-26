@@ -31,9 +31,10 @@ export interface AudioStatus {
   session: SessionState;
   /** Approximate samples buffered for playback. */
   playbackBuffered: number;
-  /** Samples in the pre-roll rolling window. */
-  prerollBuffered: number;
 }
+
+/** 5 frequency band levels (0.0–1.0) for playback visualization. */
+export type PlaybackLevels = [number, number, number, number, number];
 
 export interface AudioError {
   code: string;
@@ -103,6 +104,16 @@ export async function enqueueAudio(chunk: AudioChunk): Promise<void> {
 /** Get current audio session status. */
 export async function getStatus(): Promise<AudioStatus> {
   return await invoke<AudioStatus>("plugin:audio|get_status");
+}
+
+/**
+ * Get current playback visualization levels — 5 frequency bands (0.0–1.0).
+ *
+ * Intended to be polled at ~30fps during active playback for smooth
+ * equalizer bar animation. Cheap to call (reads pre-computed atomics).
+ */
+export async function getPlaybackLevels(): Promise<PlaybackLevels> {
+  return await invoke<PlaybackLevels>("plugin:audio|get_playback_levels");
 }
 
 // ---------------------------------------------------------------------------
