@@ -4,7 +4,7 @@ Native audio capture and playback plugin for Tauri 2. Designed for AI voice appl
 
 ## Architecture & Features
 
-The plugin runs a single audio session for the entire lifetime of the tutor screen — one path for capture, one for playback, both active at the same time.
+A session is started explicitly via `initSession` and torn down via `teardownSession` — one path for capture, one for playback, both active simultaneously for the duration of the session.
 
 ### Data path
 
@@ -34,7 +34,7 @@ The render callback feeds played samples through a 5-band biquad bandpass analyz
 
 ### Drain detection
 
-After `ffi::mark_playback_all_pushed()` is called, the render callback stamps a timestamp the first time it observes an empty ring buffer. `ffi::ms_since_playback_drained()` lets the agent loop emit a `NativePlaybackComplete` event with an accurate end-of-speech timestamp, accounting for OS pipeline latency.
+After `ffi::mark_playback_all_pushed()` is called, the render callback stamps a timestamp the first time it observes an empty ring buffer. `ffi::ms_since_playback_drained()` provides an accurate end-of-audio timestamp, accounting for OS pipeline latency between ring-buffer drain and actual speaker output.
 
 ### Platform support
 
@@ -85,13 +85,11 @@ import {
   getPlaybackLevels,
 } from "tauri-plugin-audio";
 
-// Start the session when entering the voice screen.
 await initSession({ prerollMs: 500, playbackSampleRate: 24000 });
 
 // Poll for visualization (call from your animation loop).
 const levels = await getPlaybackLevels(); // [f32; 5], each 0.0–1.0
 
-// Tear down when leaving the screen.
 await teardownSession();
 ```
 
@@ -102,7 +100,7 @@ Push PCM samples (f32, mono, matching `playbackSampleRate`) directly from any Ru
 ```rust
 use tauri_plugin_audio::ffi;
 
-// At the start of each agent turn:
+// Call before pushing audio for a new playback sequence:
 ffi::begin_playback_turn();
 
 // Stream TTS chunks (blocks with short sleeps if ring buffer is full):
