@@ -8,4 +8,5 @@ permissions = [
     "allow-enqueue-audio",
     "allow-get-status",
     "allow-get-playback-levels",
+    "allow-get-playback-progress",
 ]

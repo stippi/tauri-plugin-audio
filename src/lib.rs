@@ -52,6 +52,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::enqueue_audio,
             commands::get_status,
             commands::get_playback_levels,
+            commands::get_playback_progress,
         ])
         .setup(|app, api| {
             // Pre-allocate SPSC ring buffers and band analyzer.

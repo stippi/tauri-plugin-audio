@@ -51,3 +51,14 @@ pub(crate) async fn get_status<R: Runtime>(app: AppHandle<R>) -> Result<AudioSta
 pub(crate) async fn get_playback_levels() -> Result<[f32; 5]> {
     Ok(crate::analyzer::get_levels())
 }
+
+/// Get current sentence playback progress.
+///
+/// Returns `(sentence_index, progress)` where `progress` is `0.0..=1.0`,
+/// representing how far through the current sentence the audio output has
+/// progressed. Used by the frontend to place the `[interrupted]` marker
+/// accurately when the user interrupts playback.
+#[command]
+pub(crate) async fn get_playback_progress() -> Result<(u32, f32)> {
+    Ok(crate::ffi::playback_sentence_progress())
+}

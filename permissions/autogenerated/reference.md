@@ -9,6 +9,7 @@ Default permissions for the audio plugin - allows session management and playbac
 - `allow-enqueue-audio`
 - `allow-get-status`
 - `allow-get-playback-levels`
+- `allow-get-playback-progress`
 
 ## Permission Table
 
@@ -67,6 +68,32 @@ Enables the get_playback_levels command without any pre-configured scope.
 <td>
 
 Denies the get_playback_levels command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`audio:allow-get-playback-progress`
+
+</td>
+<td>
+
+Enables the get_playback_progress command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`audio:deny-get-playback-progress`
+
+</td>
+<td>
+
+Denies the get_playback_progress command without any pre-configured scope.
 
 </td>
 </tr>

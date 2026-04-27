@@ -16,7 +16,7 @@ export interface SessionConfig {
   playbackChannels?: number;
   /** Capture tap buffer size hint in frames. Default: 1024. */
   captureBufferSize?: number;
-  /** Pre-roll buffer duration in ms. Default: 800. */
+  /** Pre-roll buffer duration in ms. Default: 500. */
   prerollMs?: number;
 }
 
@@ -114,6 +114,22 @@ export async function getStatus(): Promise<AudioStatus> {
  */
 export async function getPlaybackLevels(): Promise<PlaybackLevels> {
   return await invoke<PlaybackLevels>("plugin:audio|get_playback_levels");
+}
+
+/** Sentence playback progress: `[sentenceIndex, progress (0.0–1.0)]`. */
+export type PlaybackProgress = [number, number];
+
+/**
+ * Get current sentence playback progress.
+ *
+ * Returns the sentence index currently being played and how far through it
+ * the audio output has progressed (0.0–1.0). Used to accurately place the
+ * `[interrupted]` marker when the user interrupts playback.
+ *
+ * Cheap to call (reads atomics + small vec lookup).
+ */
+export async function getPlaybackProgress(): Promise<PlaybackProgress> {
+  return await invoke<PlaybackProgress>("plugin:audio|get_playback_progress");
 }
 
 // ---------------------------------------------------------------------------

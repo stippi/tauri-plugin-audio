@@ -69,6 +69,25 @@ static PLAYBACK_LEVEL: AtomicUsize = AtomicUsize::new(0);
 /// speaker output (especially relevant on macOS where cpal pulls aggressively).
 static LAST_NONZERO_PULL_NANOS: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// Sentence progress tracking
+// ---------------------------------------------------------------------------
+
+/// Cumulative samples pushed into the playback ring this turn.
+/// Reset by `begin_playback_turn()`.
+static PLAYBACK_TOTAL_PUSHED: AtomicUsize = AtomicUsize::new(0);
+
+/// Cumulative samples pulled by the render callback this turn.
+/// Reset by `begin_playback_turn()`.
+static PLAYBACK_TOTAL_RENDERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Sentence boundaries: `(sentence_index, cumulative_push_offset)`.
+/// Each entry records the cumulative sample count *before* the sentence's
+/// audio was pushed. Together with `PLAYBACK_TOTAL_RENDERED`, this lets us
+/// compute which sentence is currently playing and how far into it we are.
+static SENTENCE_BOUNDARIES: std::sync::Mutex<Vec<(u32, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Set by the agent loop when all audio for the current turn has been pushed
 /// into the ring buffer. The render callback checks this: when it's set AND
 /// the ring buffer is empty, it stamps `PLAYBACK_DRAINED_NANOS`.
@@ -203,7 +222,10 @@ pub fn push_playback_samples(samples: &[f32]) -> usize {
     if let Some(prod) = PLAYBACK_PRODUCER.get() {
         if let Ok(mut prod) = prod.lock() {
             let written = prod.push_slice(samples);
-            PLAYBACK_LEVEL.fetch_add(written, Ordering::Relaxed);
+            if written > 0 {
+                PLAYBACK_LEVEL.fetch_add(written, Ordering::Relaxed);
+                PLAYBACK_TOTAL_PUSHED.fetch_add(written, Ordering::Relaxed);
+            }
             return written;
         }
     }
@@ -227,6 +249,7 @@ pub fn push_playback_samples_all(samples: &[f32]) -> usize {
             let n = prod.push_slice(&samples[written..]);
             if n > 0 {
                 PLAYBACK_LEVEL.fetch_add(n, Ordering::Relaxed);
+                PLAYBACK_TOTAL_PUSHED.fetch_add(n, Ordering::Relaxed);
                 written += n;
             }
         }
@@ -280,6 +303,11 @@ pub fn ms_since_last_playback_pull() -> u64 {
 pub fn begin_playback_turn() {
     PLAYBACK_ALL_PUSHED.store(false, Ordering::Relaxed);
     PLAYBACK_DRAINED_NANOS.store(0, Ordering::Relaxed);
+    PLAYBACK_TOTAL_PUSHED.store(0, Ordering::Relaxed);
+    PLAYBACK_TOTAL_RENDERED.store(0, Ordering::Relaxed);
+    if let Ok(mut boundaries) = SENTENCE_BOUNDARIES.lock() {
+        boundaries.clear();
+    }
 }
 
 /// Signal that no more audio will be pushed for the current turn. The render
@@ -303,6 +331,69 @@ pub fn ms_since_playback_drained() -> Option<u64> {
         return None;
     }
     Some(mono_nanos().saturating_sub(ts) / 1_000_000)
+}
+
+// ---------------------------------------------------------------------------
+// Sentence progress tracking
+// ---------------------------------------------------------------------------
+
+/// Register a sentence boundary. Call **before** pushing the sentence's audio
+/// samples. `sentence_index` is the 0-based sentence number within the turn,
+/// and the cumulative push offset is captured automatically from
+/// `PLAYBACK_TOTAL_PUSHED`.
+pub fn register_sentence_boundary(sentence_index: u32) {
+    let offset = PLAYBACK_TOTAL_PUSHED.load(Ordering::Relaxed);
+    if let Ok(mut boundaries) = SENTENCE_BOUNDARIES.lock() {
+        boundaries.push((sentence_index, offset));
+    }
+}
+
+/// Query which sentence is currently playing and how far into it we are.
+///
+/// Returns `(sentence_index, progress)` where progress is in `[0.0, 1.0]`.
+/// Returns `(0, 0.0)` if no boundaries have been registered or playback
+/// hasn't started.
+pub fn playback_sentence_progress() -> (u32, f32) {
+    let rendered = PLAYBACK_TOTAL_RENDERED.load(Ordering::Relaxed);
+    let total_pushed = PLAYBACK_TOTAL_PUSHED.load(Ordering::Relaxed);
+
+    let boundaries = match SENTENCE_BOUNDARIES.lock() {
+        Ok(b) => b.clone(),
+        Err(_) => return (0, 0.0),
+    };
+
+    if boundaries.is_empty() {
+        return (0, 0.0);
+    }
+
+    // Find the current sentence: the last boundary whose offset <= rendered.
+    let mut current_idx = 0;
+    for (i, &(_, offset)) in boundaries.iter().enumerate() {
+        if offset <= rendered {
+            current_idx = i;
+        } else {
+            break;
+        }
+    }
+
+    let (sentence_index, sentence_start) = boundaries[current_idx];
+
+    // End of this sentence = start of next sentence, or total_pushed if last.
+    let sentence_end = if current_idx + 1 < boundaries.len() {
+        boundaries[current_idx + 1].1
+    } else {
+        total_pushed
+    };
+
+    let sentence_len = sentence_end.saturating_sub(sentence_start);
+    if sentence_len == 0 {
+        return (sentence_index, 0.0);
+    }
+
+    let played_in_sentence = rendered.saturating_sub(sentence_start);
+    let progress = (played_in_sentence as f32 / sentence_len as f32).clamp(0.0, 1.0);
+
+    (sentence_index, progress)
 }
 
 /// Get the number of samples currently in the capture SPSC ring.
@@ -435,6 +526,7 @@ pub unsafe extern "C" fn rust_audio_render_callback(
             if n > 0 {
                 PLAYBACK_LEVEL.fetch_sub(n, Ordering::Relaxed);
                 RENDER_SAMPLES_PULLED.fetch_add(n, Ordering::Relaxed);
+                PLAYBACK_TOTAL_RENDERED.fetch_add(n, Ordering::Relaxed);
                 LAST_NONZERO_PULL_NANOS.store(mono_nanos(), Ordering::Relaxed);
             } else if PLAYBACK_ALL_PUSHED.load(Ordering::Acquire) {
                 // Ring buffer empty AND the producer has signalled no more audio
