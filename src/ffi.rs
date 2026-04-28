@@ -88,6 +88,10 @@ static PLAYBACK_TOTAL_RENDERED: AtomicUsize = AtomicUsize::new(0);
 static SENTENCE_BOUNDARIES: std::sync::Mutex<Vec<(u32, usize)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// When true, the render callback skips pulling samples and outputs silence.
+/// Samples remain in the ring buffer and resume exactly where they left off.
+static PLAYBACK_PAUSED: AtomicBool = AtomicBool::new(false);
+
 /// Set by the agent loop when all audio for the current turn has been pushed
 /// into the ring buffer. The render callback checks this: when it's set AND
 /// the ring buffer is empty, it stamps `PLAYBACK_DRAINED_NANOS`.
@@ -303,6 +307,7 @@ pub fn ms_since_last_playback_pull() -> u64 {
 pub fn begin_playback_turn() {
     PLAYBACK_ALL_PUSHED.store(false, Ordering::Relaxed);
     PLAYBACK_DRAINED_NANOS.store(0, Ordering::Relaxed);
+    PLAYBACK_PAUSED.store(false, Ordering::Relaxed);
     PLAYBACK_TOTAL_PUSHED.store(0, Ordering::Relaxed);
     PLAYBACK_TOTAL_RENDERED.store(0, Ordering::Relaxed);
     if let Ok(mut boundaries) = SENTENCE_BOUNDARIES.lock() {
@@ -315,6 +320,43 @@ pub fn begin_playback_turn() {
 /// ring buffer after this flag is set.
 pub fn mark_playback_all_pushed() {
     PLAYBACK_ALL_PUSHED.store(true, Ordering::Release);
+}
+
+/// Pause playback — the render callback will output silence while samples
+/// remain queued in the ring buffer. Call `resume_playback()` to continue.
+pub fn pause_playback() {
+    PLAYBACK_PAUSED.store(true, Ordering::Release);
+}
+
+/// Resume playback after `pause_playback()`. Samples continue from where
+/// they were paused.
+pub fn resume_playback() {
+    PLAYBACK_PAUSED.store(false, Ordering::Release);
+}
+
+/// Returns whether playback is currently paused.
+pub fn is_playback_paused() -> bool {
+    PLAYBACK_PAUSED.load(Ordering::Acquire)
+}
+
+/// Discard all queued playback samples. The ring buffer consumer is drained
+/// and the level counter is reset. This is a blocking operation (locks the
+/// consumer mutex) — call from a normal thread, not a realtime callback.
+pub fn clear_playback_buffer() {
+    if let Some(cons) = PLAYBACK_CONSUMER.get() {
+        if let Ok(mut cons) = cons.lock() {
+            // Drain all remaining samples
+            let mut scratch = [0.0f32; 4096];
+            loop {
+                let n = cons.pop_slice(&mut scratch);
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    PLAYBACK_LEVEL.store(0, Ordering::Relaxed);
+    PLAYBACK_PAUSED.store(false, Ordering::Relaxed);
 }
 
 /// Milliseconds elapsed since the render callback confirmed all audio has been
@@ -520,7 +562,10 @@ pub unsafe extern "C" fn rust_audio_render_callback(
 
     RENDER_CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    let read = if let Some(cons) = PLAYBACK_CONSUMER.get() {
+    // If paused, output silence — samples stay in the ring buffer.
+    let read = if PLAYBACK_PAUSED.load(Ordering::Acquire) {
+        0
+    } else if let Some(cons) = PLAYBACK_CONSUMER.get() {
         if let Ok(mut cons) = cons.try_lock() {
             let n = cons.pop_slice(slice);
             if n > 0 {
