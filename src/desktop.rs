@@ -242,10 +242,7 @@ fn run_audio_session(shutdown: Arc<AtomicBool>, playback_content_rate: u32) -> R
                 if upsample_ratio <= 1 {
                     if output_channels == 1 {
                         unsafe {
-                            ffi::rust_audio_render_callback(
-                                data.as_mut_ptr(),
-                                mono_frames as u32,
-                            );
+                            ffi::rust_audio_render_callback(data.as_mut_ptr(), mono_frames as u32);
                         }
                     } else {
                         let mut mono_buf = vec![0.0f32; mono_frames];
@@ -266,10 +263,7 @@ fn run_audio_session(shutdown: Arc<AtomicBool>, playback_content_rate: u32) -> R
                     let src_frames = mono_frames / upsample_ratio;
                     let mut src_buf = vec![0.0f32; src_frames];
                     let pulled = unsafe {
-                        ffi::rust_audio_render_callback(
-                            src_buf.as_mut_ptr(),
-                            src_frames as u32,
-                        )
+                        ffi::rust_audio_render_callback(src_buf.as_mut_ptr(), src_frames as u32)
                     } as usize;
 
                     let mut dst = 0;
@@ -310,7 +304,11 @@ fn run_audio_session(shutdown: Arc<AtomicBool>, playback_content_rate: u32) -> R
         .map_err(|e| format!("Failed to start output stream: {}", e))?;
 
     // Report engine config via the same atomics used by iOS.
-    ffi::rust_audio_report_engine_config(hw_capture_rate, playback_content_rate, upsample_ratio as u32);
+    ffi::rust_audio_report_engine_config(
+        hw_capture_rate,
+        playback_content_rate,
+        upsample_ratio as u32,
+    );
     ffi::rust_audio_report_engine_running(1);
 
     log::info!(

@@ -85,8 +85,7 @@ static PLAYBACK_TOTAL_RENDERED: AtomicUsize = AtomicUsize::new(0);
 /// Each entry records the cumulative sample count *before* the sentence's
 /// audio was pushed. Together with `PLAYBACK_TOTAL_RENDERED`, this lets us
 /// compute which sentence is currently playing and how far into it we are.
-static SENTENCE_BOUNDARIES: std::sync::Mutex<Vec<(u32, usize)>> =
-    std::sync::Mutex::new(Vec::new());
+static SENTENCE_BOUNDARIES: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// When true, the render callback skips pulling samples and outputs silence.
 /// Samples remain in the ring buffer and resume exactly where they left off.
@@ -340,8 +339,12 @@ pub fn is_playback_paused() -> bool {
 }
 
 /// Discard all queued playback samples. The ring buffer consumer is drained
-/// and the level counter is reset. This is a blocking operation (locks the
-/// consumer mutex) — call from a normal thread, not a realtime callback.
+/// and the level counter is reset. Also resets drain-detection state so that
+/// a stale `PLAYBACK_DRAINED_NANOS` timestamp from a previous turn cannot
+/// cause the next turn's drain monitor to fire prematurely.
+///
+/// This is a blocking operation (locks the consumer mutex) — call from a
+/// normal thread, not a realtime callback.
 pub fn clear_playback_buffer() {
     if let Some(cons) = PLAYBACK_CONSUMER.get() {
         if let Ok(mut cons) = cons.lock() {
@@ -357,6 +360,11 @@ pub fn clear_playback_buffer() {
     }
     PLAYBACK_LEVEL.store(0, Ordering::Relaxed);
     PLAYBACK_PAUSED.store(false, Ordering::Relaxed);
+    // Reset drain-detection state (defense in depth). Without this, a stale
+    // PLAYBACK_DRAINED_NANOS from an interrupted turn could make the next
+    // turn's drain monitor think playback is already complete.
+    PLAYBACK_ALL_PUSHED.store(false, Ordering::Relaxed);
+    PLAYBACK_DRAINED_NANOS.store(0, Ordering::Relaxed);
 }
 
 /// Milliseconds elapsed since the render callback confirmed all audio has been
@@ -550,10 +558,7 @@ pub extern "C" fn rust_audio_report_engine_running(running: u32) {
 ///
 /// Returns the number of real samples written. Remainder is zero-filled (silence).
 #[no_mangle]
-pub unsafe extern "C" fn rust_audio_render_callback(
-    buffer: *mut f32,
-    frame_count: u32,
-) -> u32 {
+pub unsafe extern "C" fn rust_audio_render_callback(buffer: *mut f32, frame_count: u32) -> u32 {
     if buffer.is_null() || frame_count == 0 {
         return 0;
     }

@@ -195,7 +195,9 @@ static BAND_LEVELS: [AtomicU32; 5] = [
 
 /// Initialize the analyzer. Called once during plugin setup.
 pub fn init() {
-    let _ = ANALYZER.set(std::sync::Mutex::new(AnalyzerState::new(DEFAULT_SAMPLE_RATE)));
+    let _ = ANALYZER.set(std::sync::Mutex::new(AnalyzerState::new(
+        DEFAULT_SAMPLE_RATE,
+    )));
 }
 
 /// Process playback samples through the band filters and update levels.
@@ -317,7 +319,11 @@ mod tests {
             .collect();
         state.process(&samples);
         let level_after_signal = state.levels[2];
-        assert!(level_after_signal > 0.1, "Band 2 should have risen: {}", level_after_signal);
+        assert!(
+            level_after_signal > 0.1,
+            "Band 2 should have risen: {}",
+            level_after_signal
+        );
 
         // Feed silence — levels should decay.
         for _ in 0..20 {

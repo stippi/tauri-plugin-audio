@@ -186,7 +186,8 @@ impl CollectorState {
 /// drain + trim (or send) on each wake.
 pub async fn run_collector() {
     let mut state = CollectorState::new();
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(COLLECTOR_INTERVAL_MS));
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_millis(COLLECTOR_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Track whether we were recording on the previous tick so we can
