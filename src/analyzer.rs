@@ -157,8 +157,8 @@ impl AnalyzerState {
         }
 
         let inv_len = 1.0 / samples.len() as f32;
-        for i in 0..5 {
-            let rms = (energy[i] * inv_len).sqrt() * RMS_GAIN;
+        for (i, &band_energy) in energy.iter().enumerate() {
+            let rms = (band_energy * inv_len).sqrt() * RMS_GAIN;
             let rms = rms.min(1.0);
 
             // Exponential smoothing with asymmetric attack/release.
