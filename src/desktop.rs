@@ -25,6 +25,9 @@ pub struct Audio<R: Runtime> {
     shutdown_flag: Arc<AtomicBool>,
     /// Handle to the audio thread (for join on teardown).
     audio_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Serializes init/teardown so React StrictMode or rapid screen changes
+    /// cannot start a second stream while the first one is still coming up.
+    lifecycle_lock: Mutex<()>,
     /// Whether a session is currently active.
     active: AtomicBool,
     /// Capture sample rate resolved at session start.
@@ -39,6 +42,7 @@ pub fn init<R: Runtime>(
         _app: app.clone(),
         shutdown_flag: Arc::new(AtomicBool::new(false)),
         audio_thread: Mutex::new(None),
+        lifecycle_lock: Mutex::new(()),
         active: AtomicBool::new(false),
         capture_sample_rate: Mutex::new(0),
     })
@@ -46,8 +50,14 @@ pub fn init<R: Runtime>(
 
 impl<R: Runtime> Audio<R> {
     pub fn init_session(&self, config: SessionConfig) -> crate::Result<OkResponse> {
+        let _lifecycle = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| crate::Error::OperationFailed("Audio lifecycle lock poisoned".into()))?;
+
         if self.active.load(Ordering::SeqCst) {
-            return Err(crate::Error::SessionAlreadyActive);
+            log::debug!("audio: init_session ignored; session already active");
+            return Ok(OkResponse::ok());
         }
 
         // Reset shutdown flag for this session.
@@ -102,6 +112,11 @@ impl<R: Runtime> Audio<R> {
     }
 
     pub fn teardown_session(&self) -> crate::Result<OkResponse> {
+        let _lifecycle = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| crate::Error::OperationFailed("Audio lifecycle lock poisoned".into()))?;
+
         if !self.active.load(Ordering::SeqCst) {
             return Ok(OkResponse::ok());
         }
