@@ -43,6 +43,18 @@ use crate::ffi;
 /// Default pre-roll duration in milliseconds.
 const DEFAULT_PREROLL_MS: u32 = 500;
 
+/// How long after the last audible playback pull the pre-roll stays
+/// suppressed, in milliseconds.
+///
+/// The devices run without echo cancellation (the audio session deliberately
+/// avoids voice-processing mode), so while TTS plays through the speaker the
+/// microphone records it. Without this guard, a PTT press right after (or
+/// into) tutor speech would deliver up to `preroll_ms` of the tutor's own
+/// voice as the beginning of the user's utterance. The margin covers OS
+/// output latency between ring-buffer pull and speaker plus the acoustic
+/// tail; pre-roll only accumulates once the speaker has been silent this long.
+const PREROLL_PLAYBACK_GUARD_MS: u64 = 300;
+
 /// How often the collector drains the SPSC ring, in milliseconds.
 /// 20ms is ~960 samples at 48kHz — small enough for low latency,
 /// large enough to avoid busy-spinning.
@@ -248,15 +260,24 @@ pub async fn run_collector() {
                 was_recording = false;
             }
 
-            // Trim to pre-roll window.
-            let hw_rate = HW_SAMPLE_RATE.load(Ordering::Relaxed);
-            if hw_rate > 0 {
-                let preroll_ms = PREROLL_MS.load(Ordering::Relaxed);
-                let max_samples = hw_rate * preroll_ms / 1000;
-                state.trim_to(max_samples);
+            // While playback is (or was very recently) audible, the queued
+            // samples contain the speaker output — the tutor's own voice.
+            // Drop them so a PTT press right after tutor speech cannot feed
+            // TTS output into STT as pre-roll (there is no echo cancellation).
+            if ffi::ms_since_last_playback_pull() <= PREROLL_PLAYBACK_GUARD_MS {
+                state.total_samples = 0;
+                state.queue.clear();
             } else {
-                // No hw rate yet — keep a reasonable default (2s at 48kHz).
-                state.trim_to(96_000);
+                // Trim to pre-roll window.
+                let hw_rate = HW_SAMPLE_RATE.load(Ordering::Relaxed);
+                if hw_rate > 0 {
+                    let preroll_ms = PREROLL_MS.load(Ordering::Relaxed);
+                    let max_samples = hw_rate * preroll_ms / 1000;
+                    state.trim_to(max_samples);
+                } else {
+                    // No hw rate yet — keep a reasonable default (2s at 48kHz).
+                    state.trim_to(96_000);
+                }
             }
         }
     }
