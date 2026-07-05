@@ -284,6 +284,21 @@ pub fn playback_level() -> usize {
     PLAYBACK_LEVEL.load(Ordering::Relaxed)
 }
 
+/// Milliseconds of audio the render callback has pulled from the playback
+/// ring this turn (reset by [`begin_playback_turn`]). Samples sit in the ring
+/// at the content rate reported by the engine (`ENGINE_PB_SAMPLE_RATE`), so
+/// the pulled count divided by that rate is the wall-clock duration the user
+/// has actually heard — resampling to the hardware rate happens downstream
+/// and does not change duration. Falls back to 24 kHz (the fixed content rate
+/// of the realtime APIs and TTS pipeline) when the engine has not reported
+/// its config yet.
+pub fn playback_rendered_ms() -> u64 {
+    let rendered = PLAYBACK_TOTAL_RENDERED.load(Ordering::Relaxed) as u64;
+    let rate = ENGINE_PB_SAMPLE_RATE.load(Ordering::Relaxed) as u64;
+    let rate = if rate == 0 { 24_000 } else { rate };
+    rendered * 1000 / rate
+}
+
 /// Milliseconds elapsed since the render callback last pulled real (non-silent)
 /// samples from the playback ring buffer. Returns `u64::MAX` if no pull has
 /// ever occurred (i.e. playback never started).
