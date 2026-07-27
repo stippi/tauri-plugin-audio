@@ -184,6 +184,11 @@ fn run_audio_session(shutdown: Arc<AtomicBool>, playback_content_rate: u32) -> R
         buffer_size: cpal::BufferSize::Default,
     };
 
+    // Preallocated mono scratch buffer — the audio callback runs on a
+    // realtime thread and must never allocate. Sized for generous callback
+    // sizes; grown outside the hot path only if the OS exceeds it.
+    let mut capture_mono_buf: Vec<f32> = vec![0.0; 8192];
+
     let input_stream = input_device
         .build_input_stream(
             &input_stream_config,
@@ -197,15 +202,22 @@ fn run_audio_session(shutdown: Arc<AtomicBool>, playback_content_rate: u32) -> R
                         );
                     }
                 } else {
-                    // Extract mono from interleaved multi-channel
-                    let mono: Vec<f32> = data
-                        .chunks(capture_channels)
-                        .map(|frame| frame[0])
-                        .collect();
+                    // Extract mono from interleaved multi-channel into the
+                    // preallocated scratch buffer (no allocation on the
+                    // realtime thread).
+                    let frames = data.len() / capture_channels;
+                    if capture_mono_buf.len() < frames {
+                        // Extremely rare (OS grew the buffer size mid-stream);
+                        // one allocation is better than dropping audio.
+                        capture_mono_buf.resize(frames, 0.0);
+                    }
+                    for (i, frame) in data.chunks_exact(capture_channels).enumerate() {
+                        capture_mono_buf[i] = frame[0];
+                    }
                     unsafe {
                         ffi::rust_audio_capture_callback(
-                            mono.as_ptr(),
-                            mono.len() as u32,
+                            capture_mono_buf.as_ptr(),
+                            frames as u32,
                             hw_capture_rate as f64,
                         );
                     }
@@ -240,7 +252,10 @@ fn run_audio_session(shutdown: Arc<AtomicBool>, playback_content_rate: u32) -> R
         output_config.sample_format(),
     );
 
-    let upsample_ratio = (hw_output_rate / playback_content_rate).max(1) as usize;
+    // Reported for diagnostics only — the render path below uses proper
+    // fractional resampling and works for any hw rate (44.1k, 48k, 96k …).
+    let upsample_ratio =
+        ((hw_output_rate as f64 / playback_content_rate as f64).round() as u32).max(1) as usize;
 
     let output_stream_config = cpal::StreamConfig {
         channels: output_config.channels(),
@@ -248,64 +263,94 @@ fn run_audio_session(shutdown: Arc<AtomicBool>, playback_content_rate: u32) -> R
         buffer_size: cpal::BufferSize::Default,
     };
 
+    // Stateful fractional resampler (content rate → hardware rate) with
+    // phase continuity across callbacks. The previous integer-ratio
+    // sample-duplication produced imaging distortion, silently mis-pitched
+    // audio on 44.1 kHz devices (ratio truncated to 1), and zero-filled the
+    // remainder of every callback whose size wasn't divisible by the ratio —
+    // an audible periodic crackle. All buffers are preallocated: the render
+    // callback runs on a realtime thread and must not allocate.
+    let step = playback_content_rate as f64 / hw_output_rate as f64;
+    let mut phase: f64 = 1.0; // start by pulling the first source sample
+    let mut s0: f32 = 0.0;
+    let mut s1: f32 = 0.0;
+    // Source scratch: carry-over samples from the previous callback live at
+    // the front, freshly pulled samples follow. `needed` is an upper bound
+    // on consumption, so a callback may leave a few samples unconsumed —
+    // they must carry over instead of being dropped (the ring pop is
+    // destructive; dropping them was an audible per-callback crackle).
+    let mut src_buf: Vec<f32> = vec![0.0; 8192];
+    let mut carry: Vec<f32> = Vec::with_capacity(64);
+    let mut mono_buf: Vec<f32> = vec![0.0; 16384];
+
     let output_stream = output_device
         .build_output_stream(
             &output_stream_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mono_frames = data.len() / output_channels;
+                if mono_buf.len() < mono_frames {
+                    mono_buf.resize(mono_frames, 0.0);
+                }
 
-                if upsample_ratio <= 1 {
-                    if output_channels == 1 {
-                        unsafe {
-                            ffi::rust_audio_render_callback(data.as_mut_ptr(), mono_frames as u32);
-                        }
-                    } else {
-                        let mut mono_buf = vec![0.0f32; mono_frames];
-                        unsafe {
-                            ffi::rust_audio_render_callback(
-                                mono_buf.as_mut_ptr(),
-                                mono_frames as u32,
-                            );
-                        }
-                        for (i, &sample) in mono_buf.iter().enumerate() {
-                            for ch in 0..output_channels {
-                                data[i * output_channels + ch] = sample;
-                            }
-                        }
-                    }
-                } else {
-                    // Upsample: pull fewer source samples, duplicate each
-                    let src_frames = mono_frames / upsample_ratio;
-                    let mut src_buf = vec![0.0f32; src_frames];
-                    let pulled = unsafe {
-                        ffi::rust_audio_render_callback(src_buf.as_mut_ptr(), src_frames as u32)
-                    } as usize;
+                // Upper bound of source samples this callback can consume.
+                let needed = (phase + step * mono_frames as f64).ceil() as usize + 1;
+                if src_buf.len() < needed {
+                    src_buf.resize(needed, 0.0);
+                }
+                let carry_n = carry.len();
+                src_buf[..carry_n].copy_from_slice(&carry);
+                carry.clear();
+                let to_pull = needed.saturating_sub(carry_n);
+                let pulled = unsafe {
+                    ffi::rust_audio_render_callback(src_buf[carry_n..].as_mut_ptr(), to_pull as u32)
+                } as usize;
+                let total = carry_n + pulled;
 
-                    let mut dst = 0;
-                    for &sample in &src_buf[..pulled] {
-                        for _ in 0..upsample_ratio {
-                            if dst < mono_frames {
-                                if output_channels == 1 {
-                                    data[dst] = sample;
-                                } else {
-                                    for ch in 0..output_channels {
-                                        data[dst * output_channels + ch] = sample;
-                                    }
-                                }
-                                dst += 1;
-                            }
-                        }
+                if total == 0 {
+                    // Ring is empty (idle / between turns): output silence and
+                    // reset the interpolator so the next turn starts clean
+                    // instead of interpolating from a stale tail sample.
+                    phase = 1.0;
+                    s0 = 0.0;
+                    s1 = 0.0;
+                    for sample in data.iter_mut() {
+                        *sample = 0.0;
                     }
-                    // Zero-fill remainder
-                    while dst < mono_frames {
-                        if output_channels == 1 {
-                            data[dst] = 0.0;
+                    return;
+                }
+
+                // Linear interpolation with a phase accumulator. Source
+                // samples beyond `total` read as silence (mid-stream
+                // underrun) — the interpolation ramps to zero instead of
+                // hard-cutting.
+                let mut src_idx = 0usize;
+                for out in mono_buf[..mono_frames].iter_mut() {
+                    while phase >= 1.0 {
+                        phase -= 1.0;
+                        s0 = s1;
+                        s1 = if src_idx < total {
+                            src_buf[src_idx]
                         } else {
-                            for ch in 0..output_channels {
-                                data[dst * output_channels + ch] = 0.0;
-                            }
+                            0.0
+                        };
+                        src_idx += 1;
+                    }
+                    *out = s0 + (s1 - s0) * phase as f32;
+                    phase += step;
+                }
+                // Unconsumed pulled samples carry over to the next callback.
+                if src_idx < total {
+                    carry.extend_from_slice(&src_buf[src_idx..total]);
+                }
+
+                // Expand mono to the device's channel count.
+                if output_channels == 1 {
+                    data[..mono_frames].copy_from_slice(&mono_buf[..mono_frames]);
+                } else {
+                    for (i, &sample) in mono_buf[..mono_frames].iter().enumerate() {
+                        for ch in 0..output_channels {
+                            data[i * output_channels + ch] = sample;
                         }
-                        dst += 1;
                     }
                 }
             },
