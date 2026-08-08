@@ -49,7 +49,6 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
         .invoke_handler(tauri::generate_handler![
             commands::init_session,
             commands::teardown_session,
-            commands::enqueue_audio,
             commands::get_status,
             commands::get_playback_levels,
             commands::get_playback_progress,

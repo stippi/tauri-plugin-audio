@@ -136,11 +136,6 @@ impl<R: Runtime> Audio<R> {
         Ok(OkResponse::ok())
     }
 
-    pub fn enqueue_audio(&self, _chunk: AudioChunk) -> crate::Result<OkResponse> {
-        // Primary playback path is Rust → ring buffer → render callback.
-        Ok(OkResponse::ok())
-    }
-
     pub fn get_status(&self) -> crate::Result<AudioStatus> {
         Ok(AudioStatus {
             session: if self.active.load(Ordering::SeqCst) {

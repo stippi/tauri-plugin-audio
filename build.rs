@@ -1,7 +1,6 @@
 const COMMANDS: &[&str] = &[
     "init_session",
     "teardown_session",
-    "enqueue_audio",
     "get_status",
 ];
 

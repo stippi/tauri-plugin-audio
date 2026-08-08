@@ -424,13 +424,6 @@ class AudioPlugin: Plugin {
         }
     }
 
-    @objc func enqueueAudio(_ invoke: Invoke) {
-        // The primary playback path is Rust → ring buffer → render callback.
-        // This command is a control-plane fallback. The actual push happens
-        // in Rust via ffi::push_playback_samples().
-        invoke.resolve(["success": true])
-    }
-
     @objc func getStatus(_ invoke: Invoke) {
         pluginQueue.async { [weak self] in
             guard let self = self else { return }

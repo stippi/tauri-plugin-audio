@@ -40,12 +40,6 @@ impl<R: Runtime> Audio<R> {
             .map_err(Into::into)
     }
 
-    pub fn enqueue_audio(&self, payload: AudioChunk) -> crate::Result<OkResponse> {
-        self.0
-            .run_mobile_plugin("enqueueAudio", payload)
-            .map_err(Into::into)
-    }
-
     pub fn get_status(&self) -> crate::Result<AudioStatus> {
         self.0
             .run_mobile_plugin("getStatus", ())

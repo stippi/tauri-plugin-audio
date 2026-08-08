@@ -20,11 +20,6 @@ export interface SessionConfig {
   prerollMs?: number;
 }
 
-export interface AudioChunk {
-  /** PCM samples as f32 array, interleaved if multi-channel. */
-  samples: number[];
-}
-
 export type SessionState = "inactive" | "active";
 
 export interface AudioStatus {
@@ -88,17 +83,6 @@ export async function initSession(config?: SessionConfig): Promise<void> {
  */
 export async function teardownSession(): Promise<void> {
   await invoke("plugin:audio|teardown_session");
-}
-
-/**
- * Enqueue a chunk of audio samples for playback.
- *
- * For high-throughput streaming (TTS), prefer pushing from Rust directly
- * via `ffi::push_playback_samples()`. This command exists for cases where
- * the frontend has audio data to play.
- */
-export async function enqueueAudio(chunk: AudioChunk): Promise<void> {
-  await invoke("plugin:audio|enqueue_audio", { payload: chunk });
 }
 
 /** Get current audio session status. */

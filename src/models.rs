@@ -77,20 +77,6 @@ fn default_preroll_ms() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Audio chunk (for playback enqueue)
-// ---------------------------------------------------------------------------
-
-/// A chunk of audio samples to enqueue for playback.
-/// Pushed from Rust (TTS provider) via `ffi::push_playback_samples()`,
-/// or from the frontend via the `enqueue_audio` command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AudioChunk {
-    /// PCM samples as f32, interleaved if multi-channel.
-    pub samples: Vec<f32>,
-}
-
-// ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
 
@@ -171,16 +157,6 @@ mod tests {
         let json = r#"{}"#;
         let cfg: SessionConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg, SessionConfig::default());
-    }
-
-    #[test]
-    fn audio_chunk_roundtrip() {
-        let chunk = AudioChunk {
-            samples: vec![0.0, 0.5, -0.5, 1.0],
-        };
-        let json = serde_json::to_string(&chunk).unwrap();
-        let decoded: AudioChunk = serde_json::from_str(&json).unwrap();
-        assert_eq!(chunk.samples, decoded.samples);
     }
 
     #[test]

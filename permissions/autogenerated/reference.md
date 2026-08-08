@@ -1,12 +1,11 @@
 ## Default Permission
 
-Default permissions for the audio plugin - allows session management and playback enqueue
+Default permissions for the audio plugin - allows session management and playback status
 
 #### This default permission set includes the following:
 
 - `allow-init-session`
 - `allow-teardown-session`
-- `allow-enqueue-audio`
 - `allow-get-status`
 - `allow-get-playback-levels`
 - `allow-get-playback-progress`
@@ -19,32 +18,6 @@ Default permissions for the audio plugin - allows session management and playbac
 <th>Description</th>
 </tr>
 
-
-<tr>
-<td>
-
-`audio:allow-enqueue-audio`
-
-</td>
-<td>
-
-Enables the enqueue_audio command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`audio:deny-enqueue-audio`
-
-</td>
-<td>
-
-Denies the enqueue_audio command without any pre-configured scope.
-
-</td>
-</tr>
 
 <tr>
 <td>
