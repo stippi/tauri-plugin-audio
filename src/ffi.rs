@@ -336,6 +336,20 @@ pub fn mark_playback_all_pushed() {
     PLAYBACK_ALL_PUSHED.store(true, Ordering::Release);
 }
 
+/// Resume the current playback turn: more audio will be pushed for the same
+/// turn after a mid-turn pause (e.g. a user-input tool confirmation).
+///
+/// Clears only the drain-detection flags, so the previous segment's
+/// `mark_playback_all_pushed` (and a drain observed while the user was in
+/// the dialog) cannot satisfy the next segment's drain monitor prematurely.
+/// Unlike [`begin_playback_turn`], the push/render counters and the
+/// sentence-boundary table keep counting and any queued tail keeps playing —
+/// position lookups stay consistent across the whole turn.
+pub fn resume_playback_turn() {
+    PLAYBACK_ALL_PUSHED.store(false, Ordering::Relaxed);
+    PLAYBACK_DRAINED_NANOS.store(0, Ordering::Relaxed);
+}
+
 /// Pause playback — the render callback will output silence while samples
 /// remain queued in the ring buffer. Call `resume_playback()` to continue.
 pub fn pause_playback() {
