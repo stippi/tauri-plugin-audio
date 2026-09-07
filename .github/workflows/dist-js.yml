@@ -1,0 +1,28 @@
+name: dist-js up to date
+
+# The tutor app consumes this package straight from the repo (git
+# dependency pinned by commit), so the built JS API is tracked. This check
+# fails when guest-js changed but dist-js was not rebuilt and committed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: dist-js matches guest-js
+        run: |
+          git diff --exit-code -- dist-js \
+            || { echo "::error::dist-js is stale — run 'bun run build' and commit the result"; exit 1; }
