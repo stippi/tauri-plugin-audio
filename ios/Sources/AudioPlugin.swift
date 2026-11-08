@@ -466,6 +466,6 @@ struct InitSessionArgs: Decodable {
 // ---------------------------------------------------------------------------
 
 @_cdecl("init_plugin_audio")
-func initPlugin() -> Plugin {
+public func initPlugin() -> Plugin {
     return AudioPlugin()
 }
